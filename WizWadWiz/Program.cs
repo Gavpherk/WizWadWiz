@@ -217,9 +217,8 @@ namespace WizWadWiz
                 
             }
 
-            if(mode == "-c")    //Create (wad) mode
+            if (mode == "-c")    //Create (wad) mode
             {
-                
                 //Make sure the input directory exists
                 if (!Directory.Exists(arg1))
                 {
@@ -231,142 +230,106 @@ namespace WizWadWiz
                 entries = new FileList[InFiles.Count()];    //Make a new FileList for storing these files in the wad
                 Console.WriteLine("Filecount: {0}", InFiles.Count());   //Debug
 
-                //For each file
-                Parallel.For(0, InFiles.Count(), i =>
+                // First pass: Gather file information without loading all data
+                for (int i = 0; i < InFiles.Length; i++)
                 {
-                    entries[i].Filename = InFiles[i].Substring(arg1.Length, InFiles[i].Length - arg1.Length);   //Remove directory info that shouldn't be included in the wad (path up to the wad contents)
-                    if(entries[i].Filename.IndexOf("\\") == 0)  //If the entry starts with a \
+                    entries[i].Filename = InFiles[i].Substring(arg1.Length, InFiles[i].Length - arg1.Length);   //Remove directory info
+                    if (entries[i].Filename.IndexOf("\\") == 0)  //If the entry starts with a \
                         entries[i].Filename = entries[i].Filename.Substring(1, entries[i].Filename.Length - 1); //Get rid of the slash
 
                     entries[i].Filename = entries[i].Filename.Replace('\\', '/');
 
-                    //MemoryStream ms = new MemoryStream(File.ReadAllBytes(InFiles[i]));  //Read
-                    entries[i].Data = File.ReadAllBytes(InFiles[i]);    //Read the file into memory
-                    entries[i].Size = (uint)entries[i].Data.Length;
-                    //Console.WriteLine("{0}, with a size of {1}, was read to memory", entries[i].Filename, entries[i].Size);
-                });
+                    // Just get file size for now, don't load the data
+                    FileInfo fileInfo = new FileInfo(InFiles[i]);
+                    entries[i].Size = (uint)fileInfo.Length;
+                }
 
-                Console.WriteLine("Files read to memory");
-
-                List<byte> WadHeader = new List<byte>();
-                List<byte> WadBody = new List<byte>();
+                Console.WriteLine("File information gathered");
 
                 var crcparam = new CrcSharp.CrcParameters(32, 0x04c11db7, 0, 0, true, true);
                 var crc = new CrcSharp.Crc(crcparam);
 
-                for (int i = 0; i < entries.Length; i++)
+                // Create file and write directly to it instead of buffering everything in memory
+                using (FileStream wadFile = new FileStream(wad, FileMode.Create, FileAccess.Write))
                 {
-                    entries[i].Offset = (uint)WadBody.Count();  //Save the offset for this entry
+                    // Write the initial header
+                    wadFile.Write(new byte[] { 0x4B, 0x49, 0x57, 0x41, 0x44, 0x02, 0x00, 0x00, 0x00 }, 0, 9); // Magic and version
+                    wadFile.Write(BitConverter.GetBytes(entries.Length), 0, 4); // File count
+                    wadFile.WriteByte(0x01); // wad2 byte
 
-                    MemoryStream Compressed = new MemoryStream();
-                    Ionic.Zlib.ZlibStream zls = new Ionic.Zlib.ZlibStream(Compressed, Ionic.Zlib.CompressionMode.Compress, Ionic.Zlib.CompressionLevel.BestCompression, false);
-                    zls.Write(entries[i].Data, 0, entries[i].Data.Length);
-                    zls.Close();
-                    byte[] compdata = Compressed.ToArray();
-                    WadBody.AddRange(compdata);   //Add the compressed data to the body of the wad
-                    entries[i].CRC = (uint)crc.CalculateAsNumeric(entries[i].Data); //Add the CRC of the compressed data (idk why they do this)
-                    entries[i].CompressedSize = (uint)compdata.Length;    //Save the size of the compressed data
-                    //Console.WriteLine("CRC: {0} : {1}", entries[i].CRC.ToString("X8"), entries[i].Filename);    //Debug
-                }
-                Console.WriteLine("Wad body added");
-                //Add wad header info
-                WadHeader.AddRange(new byte[] { 0x4B, 0x49, 0x57, 0x41, 0x44, 0x02, 0x00, 0x00, 0x00}); //Add magic and wad version (2)
-                WadHeader.AddRange(BitConverter.GetBytes(entries.Length));  //Add the file count
-                WadHeader.Add(0x01);    //Add wad2 byte (idk what it is, but it's required)
+                    // Track positions for later updates
+                    long[] offsetPositions = new long[entries.Length];
 
-                int[] offoff = new int[entries.Length];   //Keeps track of the offset for the 'Offset' field in the header (we can't know the offset until the header is finished, so we add it later)
+                    // Write placeholder header entries
+                    for (int i = 0; i < entries.Length; i++)
+                    {
+                        offsetPositions[i] = wadFile.Position;
+                        wadFile.Write(new byte[] { 0, 0, 0, 0 }, 0, 4); // Placeholder offset
+                        wadFile.Write(BitConverter.GetBytes(entries[i].Size), 0, 4); // Uncompressed size
+                        wadFile.Write(new byte[] { 0, 0, 0, 0 }, 0, 4); // Placeholder compressed size
+                        wadFile.WriteByte(0x01); // Is compressed flag
+                        wadFile.Write(new byte[] { 0, 0, 0, 0 }, 0, 4); // Placeholder CRC
+                        wadFile.Write(BitConverter.GetBytes(entries[i].Filename.Length + 1), 0, 4); // Filename length
+                        byte[] filenameBytes = ASCIIEncoding.ASCII.GetBytes(entries[i].Filename);
+                        wadFile.Write(filenameBytes, 0, filenameBytes.Length); // Filename
+                        wadFile.WriteByte(0x00); // Padding
+                    }
 
-                //Add each file to the wad header
-                for (int i = 0; i < entries.Length; i++)
-                {
-                    offoff[i] = WadHeader.Count();  //Save current offset, so that we can update the 'offset' field when the header is finished
-                    WadHeader.AddRange(new byte[] { 0x00, 0x00, 0x00, 0x00 });  //Add filler offset
-                    WadHeader.AddRange(BitConverter.GetBytes(entries[i].Size)); //Add uncompresses file size
-                    WadHeader.AddRange(BitConverter.GetBytes(entries[i].CompressedSize));   //Add compressed file size
-                    WadHeader.Add(0x01);    //Set 'IsCompressed' to 1 (we compress all files, so this is always true)
-                    WadHeader.AddRange(BitConverter.GetBytes(entries[i].CRC));  //Add the compressed-data crc (idk why they have this, because the extracted file has a crc anyway)
-                    WadHeader.AddRange(BitConverter.GetBytes(entries[i].Filename.Length+1));  //Add filename length
-                    WadHeader.AddRange(ASCIIEncoding.ASCII.GetBytes(entries[i].Filename));  //Add the filename
-                    WadHeader.Add(0x00);    //Add padding
+                    Console.WriteLine("Header placeholders written");
+
+                    // Process each file individually
+                    for (int i = 0; i < entries.Length; i++)
+                    {
+                        // Save current position as the data offset for this file
+                        entries[i].Offset = (uint)wadFile.Position;
+
+                        // Calculate CRC and compress file
+                        byte[] fileData = File.ReadAllBytes(InFiles[i]); // We still need to read the file, but one at a time
+                        entries[i].CRC = (uint)crc.CalculateAsNumeric(fileData); // Calculate CRC of uncompressed data
+
+                        // Compress directly to output file
+                        using (Ionic.Zlib.ZlibStream compressionStream =
+                               new Ionic.Zlib.ZlibStream(wadFile, Ionic.Zlib.CompressionMode.Compress,
+                                   Ionic.Zlib.CompressionLevel.BestCompression, true))
+                        {
+                            compressionStream.Write(fileData, 0, fileData.Length);
+                        }
+
+                        // Calculate compressed size
+                        entries[i].CompressedSize = (uint)(wadFile.Position - entries[i].Offset);
+
+                        // Update header with actual values
+                        long currentPosition = wadFile.Position;
+
+                        // Update offset
+                        wadFile.Position = offsetPositions[i];
+                        wadFile.Write(BitConverter.GetBytes(entries[i].Offset), 0, 4);
+
+                        // Update compressed size (offset + 8 bytes)
+                        wadFile.Position = offsetPositions[i] + 8;
+                        wadFile.Write(BitConverter.GetBytes(entries[i].CompressedSize), 0, 4);
+
+                        // Update CRC (offset + 13 bytes)
+                        wadFile.Position = offsetPositions[i] + 13;
+                        wadFile.Write(BitConverter.GetBytes(entries[i].CRC), 0, 4);
+
+                        // Return to end of file
+                        wadFile.Position = currentPosition;
+
+                        // Release memory
+                        fileData = null;
+                        GC.Collect();
+
+                        // Show progress periodically
+                        if (i % 10 == 0 || i == entries.Length - 1)
+                        {
+                            Console.WriteLine($"Processed {i + 1} of {entries.Length} files");
+                        }
+                    }
                 }
-                Console.WriteLine("Wad Header added");
-                //Fix the offsets
-                for(int i = 0; i < entries.Length; i++)
-                {
-                    byte[] offsetbytes = BitConverter.GetBytes(WadHeader.Count() + entries[i].Offset);
-                    WadHeader[offoff[i]] = offsetbytes[0];
-                    WadHeader[offoff[i] + 1] = offsetbytes[1];
-                    WadHeader[offoff[i] + 2] = offsetbytes[2];
-                    WadHeader[offoff[i] + 3] = offsetbytes[3];
-                }
-                Console.WriteLine("Offsets fixed");
-                byte[] Output = WadHeader.Concat(WadBody).ToArray();
-                File.WriteAllBytes(wad, Output);  //Save 
+
                 Console.WriteLine("Wad Saved");
                 Quit();
-            }
-
-            if (mode != "-c")    //If the tool is not in create mode, check if the wad exists
-            {
-                if (!System.IO.File.Exists(wad))
-                {
-                    Console.WriteLine("Wad file not found!");
-                    PrintHelp();
-                }
-                else    //If the file exists
-                {
-                    Console.WriteLine("Reading wad to memory...");
-                    entries = ReadWad(wad);    //Read the wad into the 'entries' array
-                }
-            }
-
-            if(mode == "-d" && !File.Exists(arg1))  //If using diff mode, and the second file doesn't exist
-            {
-                Console.WriteLine("Second wad does not exist!");
-                PrintHelp();
-            }
-
-            if(mode == "-w2z")  //If using Wad2Zip mode
-            {
-                //Stopwatch for diagnostics
-                System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
-                stopwatch.Start();
-
-                Console.WriteLine("Calculating CRC's...");
-
-                //For each file in the wad; extract it in-memory, calculate the CRC of the extracted data, and update the entry's CRC field (because this is done in-memory, it should be less than a couple of seconds)
-                Parallel.For(0, entries.Length, i =>
-                {
-                    byte[] filemem = new byte[0];
-
-                    if (entries[i].IsCompressed)   //If the file is marked as compressed
-                    {
-                        filemem = Ionic.Zlib.ZlibStream.UncompressBuffer(entries[i].Data);
-                        Array.Copy(entries[i].Data, 2, entries[i].Data, 0, entries[i].Data.Length - 6);
-                    }
-                    else    //If the file isn't compressed
-                        filemem = entries[i].Data;
-
-
-                    Ionic.Crc.CRC32 crc = new Ionic.Crc.CRC32();
-                    entries[i].CRC = (uint)crc.GetCrc32(new MemoryStream(filemem)); //Replace the entries' crc with the CRC of the compressed data (KI are shit and use their own incompatible polynomials for their checksum, so we need to recalculate it with a standard polynomial)
-                });
-                stopwatch.Stop();
-
-                //Stopwatch for timing the zip-process
-                System.Diagnostics.Stopwatch ziptimer = new System.Diagnostics.Stopwatch();
-                ziptimer.Start();
-                byte[] outputfile = Zipper(entries);    //Add all file entries to a zip in-memory, and return the zip
-                ziptimer.Stop();
-
-                File.WriteAllBytes(wad + ".zip", outputfile);   //Save the created zip to disk (input filename with .zip appended)
-
-                MainTimer.Stop();
-
-                Console.WriteLine("Updated CRC's in {0} Seconds", stopwatch.Elapsed.TotalSeconds);
-                Console.WriteLine("Zipped in {0} Seconds", ziptimer.Elapsed.TotalSeconds);
-                Console.WriteLine("Total program runtime: {0} Seconds", MainTimer.Elapsed.TotalSeconds);
-                Quit(); //Exit
             }
 
 
